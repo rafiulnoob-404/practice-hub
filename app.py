@@ -273,6 +273,12 @@ def set_settings():
     return jsonify(ok=True)
 
 
+@app.get("/api/health")
+def health():
+    return jsonify(github=GH, repo=GH_REPO, branch=GH_BRANCH, path=GH_PATH,
+                   token_set=bool(GH_TOKEN))
+
+
 if __name__ == "__main__":
     if not GH:
         os.makedirs(QDIR, exist_ok=True)
