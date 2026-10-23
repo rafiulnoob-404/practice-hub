@@ -1,10 +1,58 @@
-import json, os, re, threading, urllib.error, urllib.request
+import base64, json, os, re, threading, urllib.error, urllib.request
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 BASE = os.path.dirname(os.path.abspath(__file__))
 QDIR = os.environ.get("QUESTIONS_DIR", os.path.join(BASE, "questions"))
 CFG = os.path.join(BASE, "config.json")
+
+# ---- GitHub storage (used only if GITHUB_TOKEN + DATA_REPO are set) ----
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GH_REPO = os.environ.get("DATA_REPO", "")
+GH_BRANCH = os.environ.get("DATA_BRANCH", "data")
+GH_PATH = os.environ.get("DATA_PATH", "questions").strip("/")
+GH = bool(GH_TOKEN and GH_REPO)
+cache = {}        # name -> [text, sha]
+names_cache = []  # list of file names
+
+
+def gh_req(method, path, body=None, query=""):
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}{query}"
+    req = urllib.request.Request(
+        url, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {GH_TOKEN}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "practice-hub",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def gh_fetch(name):
+    j = gh_req("GET", f"{GH_PATH}/{name}", query=f"?ref={GH_BRANCH}")
+    text = base64.b64decode(j["content"]).decode("utf-8")
+    cache[name] = [text, j["sha"]]
+    return cache[name]
+
+
+def gh_put(name, text):
+    if name not in cache:
+        gh_fetch(name)
+    for attempt in range(2):
+        body = {"message": f"update {name}",
+                "content": base64.b64encode(text.encode("utf-8")).decode(),
+                "sha": cache[name][1], "branch": GH_BRANCH}
+        try:
+            res = gh_req("PUT", f"{GH_PATH}/{name}", body)
+            cache[name] = [text, res["content"]["sha"]]
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 422) and attempt == 0:
+                cache[name][1] = gh_fetch(name)[1]  # stale sha: refresh and retry
+                cache[name][0] = text
+                continue
+            raise
 
 
 def cfg():
@@ -75,12 +123,33 @@ def path_of(name):
     return os.path.join(QDIR, name)
 
 
+def list_names():
+    global names_cache
+    if GH:
+        if not names_cache:
+            items = gh_req("GET", GH_PATH, query=f"?ref={GH_BRANCH}")
+            names_cache = [i["name"] for i in items if i["type"] == "file" and FN.match(i["name"])]
+        return names_cache
+    return [n for n in os.listdir(QDIR) if FN.match(n)]
+
+
 def read(name):
+    if not FN.match(name or ""):
+        raise ValueError("bad file name")
+    if GH:
+        if name not in cache:
+            gh_fetch(name)
+        return parse(cache[name][0])
     with open(path_of(name), encoding="utf-8") as f:
         return parse(f.read())
 
 
 def write(name, head, qs):
+    if GH:
+        if not FN.match(name or ""):
+            raise ValueError("bad file name")
+        gh_put(name, ser(head, qs))
+        return
     p = path_of(name)
     with open(p + ".tmp", "w", encoding="utf-8", newline="\n") as f:
         f.write(ser(head, qs))
@@ -106,7 +175,7 @@ def index():
 @app.get("/api/data")
 def data():
     out = []
-    for n in sorted(os.listdir(QDIR)):
+    for n in sorted(list_names()):
         m = FN.match(n)
         if not m:
             continue
@@ -117,6 +186,15 @@ def data():
                         "exp": q["exp"], "st": q["st"]})
     out.sort(key=lambda x: (x["k"], x["fn"], x["n"]))
     return jsonify(out)
+
+
+@app.post("/api/reload")
+def reload_cache():
+    # re-pull everything from GitHub (use after editing question files on GitHub)
+    with lock:
+        cache.clear()
+        names_cache.clear()
+    return jsonify(ok=True)
 
 
 @app.post("/api/status")
@@ -164,7 +242,10 @@ def explain():
     except Exception as e:
         return jsonify(error=str(e)), 502
     text = re.sub(r"^#+\s*", "", text, flags=re.M).strip()
-    update(b["file"], q["n"], exp=text)
+    try:
+        update(b["file"], q["n"], exp=text)
+    except Exception as e:
+        return jsonify(error=f"Save failed: {e}"), 502
     return jsonify(exp=text)
 
 
@@ -193,5 +274,7 @@ def set_settings():
 
 
 if __name__ == "__main__":
-    os.makedirs(QDIR, exist_ok=True)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    if not GH:
+        os.makedirs(QDIR, exist_ok=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1", port=port, debug=False)
