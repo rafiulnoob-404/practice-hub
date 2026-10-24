@@ -590,7 +590,7 @@ A
 রচয়িতা /গীতিকার- সেলিনা রহমান।
 
 ## status
-skipped
+incorrect
 
 ### Q 35
 
