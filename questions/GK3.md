@@ -14,7 +14,7 @@ C
 
 
 ## status
-skipped
+correct
 
 ### Q 3
 
