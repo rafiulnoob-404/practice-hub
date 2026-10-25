@@ -294,7 +294,7 @@ def health_system():
         status="healthy" if is_healthy else "warning",
         cpu_usage_pct=cpu_usage,
         ram_used_pct=ram_usage,
-        disk_free_gb=disk_free
+        disk_free_mb=disk_free
     ), 200 if is_healthy else 500
 
 
