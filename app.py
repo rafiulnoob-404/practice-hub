@@ -1,4 +1,4 @@
-import base64, json, os, re, threading, urllib.error, urllib.request
+import base64, json, os, re, threading, urllib.error, urllib.request, psutil
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
@@ -277,6 +277,25 @@ def set_settings():
 def health():
     return jsonify(github=GH, repo=GH_REPO, branch=GH_BRANCH, path=GH_PATH,
                    token_set=bool(GH_TOKEN))
+
+
+@app.get("/system/health")
+def health_system():
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    cpu_usage = psutil.cpu_percent(interval=None) 
+    ram_usage = ram.percent
+    disk_free = round(disk.free / (1024**2), 2) 
+    
+    is_healthy = ram_usage < 90 and disk.percent < 90
+    
+    return jsonify(
+        status="healthy" if is_healthy else "warning",
+        cpu_usage_pct=cpu_usage,
+        ram_used_pct=ram_usage,
+        disk_free_gb=disk_free
+    ), 200 if is_healthy else 500
 
 
 if __name__ == "__main__":
