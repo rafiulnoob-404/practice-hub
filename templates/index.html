@@ -260,7 +260,7 @@ async function pick(i){
  if(answered)return;answered=true;const q=queue[cur],a=q.ans;
  document.querySelectorAll('.opt').forEach((o,k)=>{o.classList.add('done');if(k===a)o.classList.add('ok');else if(k===i)o.classList.add('bad')});
  $('#skip').hidden=true;sol();
- sched(a>=0&&i===a?2000:5000);   // correct: 2s, incorrect: 5s
+ sched(a>=0&&i===a?1000:5000);   // correct: 1s, incorrect: 5s
  if(a<0)toast('Could not read the answer; check the "## answer" line.');
  else await mark(q,i===a?'correct':'incorrect')}
 function sol(){
