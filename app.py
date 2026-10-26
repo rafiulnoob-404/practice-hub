@@ -1,19 +1,27 @@
-import base64, json, os, re, threading, urllib.error, urllib.request, psutil
+import atexit, base64, json, os, re, threading, time, urllib.error, urllib.request, psutil
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 BASE = os.path.dirname(os.path.abspath(__file__))
 QDIR = os.environ.get("QUESTIONS_DIR", os.path.join(BASE, "questions"))
-CFG = os.path.join(BASE, "config.json")
+FDIR = os.environ.get("FLASHCARD_DIR", os.path.join(BASE, "flashcard"))
+FC_FILE = "card.md"
 
 # ---- GitHub storage (used only if GITHUB_TOKEN + DATA_REPO are set) ----
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GH_REPO = os.environ.get("DATA_REPO", "")
 GH_BRANCH = os.environ.get("DATA_BRANCH", "data")
 GH_PATH = os.environ.get("DATA_PATH", "questions").strip("/")
+GH_FC = os.environ.get("DATA_FC_PATH", "flashcard").strip("/")
+SYNC_SECS = int(os.environ.get("SYNC_SECS", "300"))  # batch commits every 5 min
 GH = bool(GH_TOKEN and GH_REPO)
-cache = {}        # name -> [text, sha]
-names_cache = []  # list of file names
+
+LOC = {"q": QDIR, "f": FDIR}
+GHP = {"q": GH_PATH, "f": GH_FC}
+cache = {}        # (kind, name) -> [text, sha]
+dirty = set()     # keys changed but not yet committed to GitHub
+names_cache = []
+lock = threading.RLock()
 
 
 def gh_req(method, path, body=None, query=""):
@@ -29,46 +37,95 @@ def gh_req(method, path, body=None, query=""):
         return json.load(r)
 
 
-def gh_fetch(name):
-    j = gh_req("GET", f"{GH_PATH}/{name}", query=f"?ref={GH_BRANCH}")
-    text = base64.b64decode(j["content"]).decode("utf-8")
-    cache[name] = [text, j["sha"]]
-    return cache[name]
+def gh_fetch(kind, name):
+    try:
+        j = gh_req("GET", f"{GHP[kind]}/{name}", query=f"?ref={GH_BRANCH}")
+        v = [base64.b64decode(j["content"]).decode("utf-8"), j["sha"]]
+    except urllib.error.HTTPError as e:
+        if e.code != 404 or kind != "f":
+            raise
+        v = ["", None]  # flashcard file doesn't exist yet
+    cache[(kind, name)] = v
+    return v
 
 
-def gh_put(name, text):
-    if name not in cache:
-        gh_fetch(name)
+def gh_commit(key):
+    kind, name = key
+    path = f"{GHP[kind]}/{name}"
     for attempt in range(2):
+        text, sha = cache[key]
         body = {"message": f"update {name}",
                 "content": base64.b64encode(text.encode("utf-8")).decode(),
-                "sha": cache[name][1], "branch": GH_BRANCH}
+                "branch": GH_BRANCH}
+        if sha:
+            body["sha"] = sha
         try:
-            res = gh_req("PUT", f"{GH_PATH}/{name}", body)
-            cache[name] = [text, res["content"]["sha"]]
+            res = gh_req("PUT", path, body)
+            cache[key][1] = res["content"]["sha"]
             return
         except urllib.error.HTTPError as e:
             if e.code in (409, 422) and attempt == 0:
-                cache[name][1] = gh_fetch(name)[1]  # stale sha: refresh and retry
-                cache[name][0] = text
+                try:
+                    cache[key][1] = gh_req("GET", path, query=f"?ref={GH_BRANCH}")["sha"]
+                except urllib.error.HTTPError as e2:
+                    if e2.code != 404:
+                        raise
+                    cache[key][1] = None
                 continue
             raise
 
 
-def cfg():
-    d = {"gemini_key": os.environ.get("GEMINI_API_KEY", ""),
-         "model": os.environ.get("GEMINI_MODEL", "gemini-3.6-flash-lite")}
+def flush():
+    """Commit all pending files to GitHub (one commit per changed file)."""
+    with lock:
+        for key in list(dirty):
+            try:
+                gh_commit(key)
+                dirty.discard(key)
+            except Exception as e:
+                print(f"[sync] {key} failed: {e}", flush=True)
+        return len(dirty)
+
+
+def sync_loop():
+    while True:
+        time.sleep(SYNC_SECS)
+        flush()
+
+
+if GH:
+    threading.Thread(target=sync_loop, daemon=True).start()
+    atexit.register(flush)
+
+
+def load(kind, name):
+    if GH:
+        if (kind, name) not in cache:
+            gh_fetch(kind, name)
+        return cache[(kind, name)][0]
     try:
-        with open(CFG, encoding="utf-8") as f:
-            d.update({k: v for k, v in json.load(f).items() if v})
-    except Exception:
-        pass
-    return d
+        with open(os.path.join(LOC[kind], name), encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
 
 
-lock = threading.Lock()
+def save(kind, name, text):
+    if GH:
+        if (kind, name) not in cache:
+            gh_fetch(kind, name)
+        cache[(kind, name)][0] = text
+        dirty.add((kind, name))   # committed later by sync_loop
+        return
+    os.makedirs(LOC[kind], exist_ok=True)
+    p = os.path.join(LOC[kind], name)
+    with open(p + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(p + ".tmp", p)
 
-FN = re.compile(r"^(GK|[BCPEWM])(\d+)\.md$", re.I)
+
+# ---------------- questions ----------------
+FN = re.compile(r"^(GK|[BCPEWMT])(\d+)\.md$", re.I)
 HEAD = re.compile(r"^[ \t]*###\s*Q\s*(\d+)[^\n]*\n", re.I | re.M)
 SEC = re.compile(r"^[ \t]*##\s*(answer|explanation|status)[ \t]*:?[ \t]*([^\n]*)\n?", re.I | re.M)
 KEYMAP = {"answer": "ans", "explanation": "exp", "status": "st"}
@@ -117,12 +174,6 @@ def ans_index(q):
     return -1
 
 
-def path_of(name):
-    if not FN.match(name or ""):
-        raise ValueError("bad file name")
-    return os.path.join(QDIR, name)
-
-
 def list_names():
     global names_cache
     if GH:
@@ -130,30 +181,20 @@ def list_names():
             items = gh_req("GET", GH_PATH, query=f"?ref={GH_BRANCH}")
             names_cache = [i["name"] for i in items if i["type"] == "file" and FN.match(i["name"])]
         return names_cache
+    os.makedirs(QDIR, exist_ok=True)
     return [n for n in os.listdir(QDIR) if FN.match(n)]
 
 
 def read(name):
     if not FN.match(name or ""):
         raise ValueError("bad file name")
-    if GH:
-        if name not in cache:
-            gh_fetch(name)
-        return parse(cache[name][0])
-    with open(path_of(name), encoding="utf-8") as f:
-        return parse(f.read())
+    return parse(load("q", name))
 
 
 def write(name, head, qs):
-    if GH:
-        if not FN.match(name or ""):
-            raise ValueError("bad file name")
-        gh_put(name, ser(head, qs))
-        return
-    p = path_of(name)
-    with open(p + ".tmp", "w", encoding="utf-8", newline="\n") as f:
-        f.write(ser(head, qs))
-    os.replace(p + ".tmp", p)
+    if not FN.match(name or ""):
+        raise ValueError("bad file name")
+    save("q", name, ser(head, qs))
 
 
 def update(name, n, **fields):
@@ -167,6 +208,86 @@ def update(name, n, **fields):
         return q
 
 
+# ---------------- flashcards (flashcard/card.md) ----------------
+CARD_HEAD = re.compile(r"^### Card (\d+)[ \t]*\n(?:<!-- color: (#[0-9a-fA-F]{6}) -->[ \t]*\n)?", re.M)
+COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def parse_cards(t):
+    ms = list(CARD_HEAD.finditer(t))
+    out = []
+    for i, m in enumerate(ms):
+        body = t[m.end(): ms[i + 1].start() if i + 1 < len(ms) else len(t)].strip()
+        out.append({"id": int(m.group(1)), "color": m.group(2) or "#fff3a3", "body": body})
+    return out
+
+
+def ser_cards(cs):
+    return "# Flashcards\n\n" + "\n".join(
+        f"### Card {c['id']}\n<!-- color: {c['color']} -->\n\n{c['body']}\n" for c in cs)
+
+
+def clean_body(b):
+    b = (b or "").strip()
+    return re.sub(r"^(### Card )", r"\\\1", b, flags=re.M)  # keep body from faking a card header
+
+
+def cards_read():
+    return parse_cards(load("f", FC_FILE))
+
+
+def cards_write(cs):
+    save("f", FC_FILE, ser_cards(cs))
+
+
+@app.get("/api/cards")
+def cards_list():
+    with lock:
+        return jsonify(cards_read())
+
+
+@app.post("/api/cards")
+def cards_add():
+    b = request.get_json() or {}
+    body = clean_body(b.get("body"))
+    if not body:
+        return jsonify(error="empty card"), 400
+    color = b.get("color") if COLOR.match(b.get("color") or "") else "#fff3a3"
+    with lock:
+        cs = cards_read()
+        c = {"id": max([x["id"] for x in cs], default=0) + 1, "color": color, "body": body}
+        cs.append(c)
+        cards_write(cs)
+    return jsonify(c)
+
+
+@app.put("/api/cards/<int:cid>")
+def cards_edit(cid):
+    b = request.get_json() or {}
+    body = clean_body(b.get("body"))
+    if not body:
+        return jsonify(error="empty card"), 400
+    with lock:
+        cs = cards_read()
+        c = next((x for x in cs if x["id"] == cid), None)
+        if not c:
+            return jsonify(error="not found"), 404
+        c["body"] = body
+        if COLOR.match(b.get("color") or ""):
+            c["color"] = b["color"]
+        cards_write(cs)
+    return jsonify(c)
+
+
+@app.delete("/api/cards/<int:cid>")
+def cards_del(cid):
+    with lock:
+        cs = [x for x in cards_read() if x["id"] != cid]
+        cards_write(cs)
+    return jsonify(ok=True)
+
+
+# ---------------- routes ----------------
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -175,26 +296,35 @@ def index():
 @app.get("/api/data")
 def data():
     out = []
-    for n in sorted(list_names()):
-        m = FN.match(n)
-        if not m:
-            continue
-        _, qs = read(n)
-        for q in qs:
-            out.append({"file": n, "k": m.group(1).upper(), "fn": int(m.group(2)), "n": q["n"],
-                        "stem": "\n".join(q["stem"]), "opts": q["opts"], "ans": ans_index(q),
-                        "exp": q["exp"], "st": q["st"]})
+    with lock:
+        for n in sorted(list_names()):
+            m = FN.match(n)
+            if not m:
+                continue
+            _, qs = read(n)
+            for q in qs:
+                out.append({"file": n, "k": m.group(1).upper(), "fn": int(m.group(2)), "n": q["n"],
+                            "stem": "\n".join(q["stem"]), "opts": q["opts"], "ans": ans_index(q),
+                            "exp": q["exp"], "st": q["st"]})
     out.sort(key=lambda x: (x["k"], x["fn"], x["n"]))
     return jsonify(out)
 
 
 @app.post("/api/reload")
 def reload_cache():
-    # re-pull everything from GitHub (use after editing question files on GitHub)
+    # re-pull from GitHub; pending (uncommitted) files are pushed first and never dropped
+    flush()
     with lock:
-        cache.clear()
+        for k in list(cache):
+            if k not in dirty:
+                del cache[k]
         names_cache.clear()
     return jsonify(ok=True)
+
+
+@app.post("/api/sync")
+def sync_now():
+    return jsonify(ok=True, pending=flush() if GH else 0)
 
 
 @app.post("/api/status")
@@ -209,87 +339,20 @@ def status():
     return jsonify(ok=True)
 
 
-@app.post("/api/explain")
-def explain():
-    b = request.get_json()
-    c = cfg()
-    if not c["gemini_key"]:
-        return jsonify(error="Add your Gemini API key in Settings"), 400
-    try:
-        _, qs = read(b["file"])
-        q = next(x for x in qs if x["n"] == int(b["n"]))
-    except Exception as e:
-        return jsonify(error=str(e)), 400
-    a = ans_index(q)
-    prompt = (
-        "Question:\n" + "\n".join(q["stem"]) + "\nOptions:\n"
-        + "\n".join(f"{'ABCD'[i]}. {o}" for i, o in enumerate(q["opts"]))
-        + f"\nCorrect answer: {'ABCD'[a] if a >= 0 else q['ans']}\n\n"
-        "Explain why this answer is correct. Format: one short paragraph, or a small markdown table "
-        "if a comparison helps. Write in the same language as the question. Use LaTeX with $...$ for "
-        "formulas and chemical equations. No headings, no preamble."
-    )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{c['model']}:generateContent"
-    req = urllib.request.Request(
-        url, data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": c["gemini_key"]})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            j = json.load(r)
-        text = "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"])
-    except urllib.error.HTTPError as e:
-        return jsonify(error=f"Gemini {e.code}: {e.read().decode()[:300]}"), 502
-    except Exception as e:
-        return jsonify(error=str(e)), 502
-    text = re.sub(r"^#+\s*", "", text, flags=re.M).strip()
-    try:
-        update(b["file"], q["n"], exp=text)
-    except Exception as e:
-        return jsonify(error=f"Save failed: {e}"), 502
-    return jsonify(exp=text)
-
-
-@app.get("/api/settings")
-def get_settings():
-    c = cfg()
-    return jsonify(model=c["model"], has_key=bool(c["gemini_key"]), hint=c["gemini_key"][-4:])
-
-
-@app.post("/api/settings")
-def set_settings():
-    b = request.get_json() or {}
-    d = {}
-    try:
-        with open(CFG, encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        pass
-    if (b.get("gemini_key") or "").strip():
-        d["gemini_key"] = b["gemini_key"].strip()
-    if (b.get("model") or "").strip():
-        d["model"] = b["model"].strip()
-    with open(CFG, "w", encoding="utf-8") as f:
-        json.dump(d, f)
-    return jsonify(ok=True)
-
-
 @app.get("/api/health")
 def health():
     return jsonify(github=GH, repo=GH_REPO, branch=GH_BRANCH, path=GH_PATH,
-                   token_set=bool(GH_TOKEN))
+                   token_set=bool(GH_TOKEN), pending=len(dirty), sync_secs=SYNC_SECS)
 
 
 @app.get("/system/health")
 def health_system():
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
-    
-    cpu_usage = psutil.cpu_percent(interval=None) 
+    cpu_usage = psutil.cpu_percent(interval=None)
     ram_usage = ram.percent
-    disk_free = round(disk.free / (1024**2), 2) 
-    
+    disk_free = round(disk.free / (1024**2), 2)
     is_healthy = ram_usage < 90 and disk.percent < 90
-    
     return jsonify(
         status="healthy" if is_healthy else "warning",
         cpu_usage_pct=cpu_usage,
@@ -301,5 +364,6 @@ def health_system():
 if __name__ == "__main__":
     if not GH:
         os.makedirs(QDIR, exist_ok=True)
+        os.makedirs(FDIR, exist_ok=True)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1", port=port, debug=False)
