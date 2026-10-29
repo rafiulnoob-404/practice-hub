@@ -88,3 +88,23 @@ Hz-193; (2.6- জৈবযৌগের সমাণুতা ও এর প্�
 **Answer:** C
 
 RD-104; Genesis means the origin or the beginning of something. It is commonly used to refer to the start or creation of something (e.g., the Book of Genesis in the Bible). While "Introduction", "Preface", and "Foreword" are related to the starting part of a book, Genesis specifically means beginning or origin.
+
+### Card 9
+<!-- color: #fff3a3 -->
+
+**Q:** NH3 অণুর গঠন আকৃতি কোনটি?
+
+- A. বিকৃত চতুস্তলকের V আকৃতি
+- B. ত্রিকোণাকার দ্বিপিরামিড
+- C. **ত্রিকোণাকার পিরামিড ✓**
+- D. চতুস্তলকের ন্যায়
+
+### Card 10
+<!-- color: #fff3a3 -->
+
+**Q:** The meeting came to a close. Here the word 'close' is-
+
+- A. A verb
+- B. An adverb
+- C. **A noun ✓**
+- D. An adjective
