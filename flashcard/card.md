@@ -108,3 +108,12 @@ RD-104; Genesis means the origin or the beginning of something. It is commonly u
 - B. An adverb
 - C. **A noun ✓**
 - D. An adjective
+
+### Card 11
+<!-- color: #fff3a3 -->
+
+**Q:** অ্যামোনিয়াম অক্সালেট দ্রবণসহ পরীক্ষায় কোন আয়ন শনাক্ত করা হয়?
+
+**Answer:** A
+
+Hz-202; (2.13-আয়ন শনাক্তকরণ); NH4+ → নেসলার দ্রবণ পরীক্ষায়। Na+ → পটাসিয়াম পাইরোঅ্যান্টিমোনেট দ্রবণসহ পরীক্ষা, Zn2+ → পটাসিয়াম ফেরোসায়ানাইড দ্রবণসহ পরীক্ষা।
